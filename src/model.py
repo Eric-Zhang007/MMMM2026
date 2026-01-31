@@ -17,7 +17,7 @@ class DWTSModel(nn.Module):
 
     def forward(self, week_data: Dict, all_feats: torch.Tensor):
         device = all_feats.device
-        eps = self.config["features"]["eps"]
+        eps = float(self.config["features"]["eps"])
         c_idx = torch.tensor(week_data["celebrities"], device=device)
         p_idx = torch.tensor(week_data["partners"], device=device)
         t_idx = torch.tensor(week_data["teams"], device=device)

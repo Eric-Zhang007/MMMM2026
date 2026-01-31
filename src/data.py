@@ -7,7 +7,7 @@ class DWTSDataset:
     def __init__(self, csv_path: str, config: Dict):
         self.df = pd.read_csv(csv_path)
         self.config = config
-        self.eps = config["features"]["eps"]
+        self.eps = float(config["features"]["eps"])
         self.prepare_data()
 
     def prepare_data(self):

@@ -1,7 +1,7 @@
 data_path: "2026_MCM_Problem_C_Data.csv"
 output_root: "outputs"
 run_name: "dwts_baseline"
-device: "auto"
+device: "cpu"
 
 features:
   use_homestate: true
@@ -30,12 +30,12 @@ loss:
 
 training:
   train_mode: "all_train"
-  epochs: 200
+  epochs: 60
   lr: 0.001
   weight_decay: 0
   grad_clip_norm: 1.0
-  grad_accum_steps: 8
-  patience: 20
+  grad_accum_steps: 1
+  patience: 10
   monitor: "train_ElimTop1Acc"
   resume_from: "none"
 
@@ -48,10 +48,10 @@ training:
     total_steps: 0
 
 tune:
-  enabled: false
+  enabled: true
   n_trials: 80
-  n_jobs: "auto"
+  n_jobs: 24
   allow_parallel_gpu: false
-  epochs: 80
+  epochs: 60
   patience: 10
   study_name: "dwts_tpe"

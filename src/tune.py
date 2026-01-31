@@ -272,8 +272,17 @@ def run_tune(config_path: Optional[str], n_trials: Optional[int], n_jobs: Option
     # Summarize best results
     study = optuna.load_study(study_name=study_name, storage=storage_url)
 
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if len(completed) == 0:
+        print("[TUNE ERROR] No successful trials. All trials failed.")
+        print("[TUNE ERROR] Please check the first failure stack trace above (often data parsing / config types).")
+        failed = [t for t in study.trials if t.state == optuna.trial.TrialState.FAIL]
+        print(f"[TUNE ERROR] failed_trials={len(failed)} total_trials={len(study.trials)}")
+        return
+
     best_params = dict(study.best_params)
     best_value = float(study.best_value)
+
 
     with open(os.path.join(tune_root, "best_params.json"), "w", encoding="utf-8") as f:
         json.dump({"best_value": best_value, "best_params": best_params}, f, ensure_ascii=False, indent=2)
