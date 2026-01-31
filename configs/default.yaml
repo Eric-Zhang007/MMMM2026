@@ -1,0 +1,48 @@
+data_path: "2026_MCM_Problem_C_Data.csv"
+output_root: "outputs"
+run_name: "dwts_baseline"
+device: "auto"
+
+features:
+  use_homestate: true
+  eps: 1e-6
+
+model:
+  k_variance_ratio: 1.0
+  lambda_perf: 1.0
+  tau_rank: 0.3
+  lambda_beta: 0.01
+  beta_center: 1.0              # 必改：避免把 beta 拉向 0
+  phi_reg: "elasticnet"         # 建议：解释性更好
+  lambda_phi_l1: 0.001
+  lambda_phi_l2: 0.001
+  lambda_theta: 0.01            # 建议分开
+  lambda_u: 0.01
+
+loss:
+  xi_margin: 0.05
+  xi_twist: 0.05
+  xi_tb: 0.05
+  lambdaA: 0.2
+  lambdaB: 0.2
+  twist_mode: "hinge"
+
+training:
+  train_mode: "all_train"
+  epochs: 200
+  lr: 0.001
+  weight_decay: 0
+  grad_clip_norm: 1.0
+  patience: 20
+  monitor: "train_ElimTop1Acc"
+  resume_from: "last"           # {last, best}
+  scheduler:
+    type: "plateau"             # {none, plateau, warmup_cosine}
+    plateau_factor: 0.5
+    plateau_patience: 5
+    min_lr: 1e-6
+
+tune:
+  enabled: false
+  n_trials: 50
+  n_jobs: 4
