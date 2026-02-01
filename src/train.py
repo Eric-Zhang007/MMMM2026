@@ -1,360 +1,458 @@
-import argparse
-import json
-import logging
-import math
 import os
-from typing import Any, Dict, Optional, Tuple
+import json
+from typing import Dict, Any, Optional, List
 
+import numpy as np
 import pandas as pd
 import torch
-from torch.utils.tensorboard import SummaryWriter
 
+try:
+    from torch.utils.tensorboard import SummaryWriter  # type: ignore
+except Exception:  # pragma: no cover
+    SummaryWriter = None  # type: ignore
+
+from src.utils import load_config, save_resolved_config, setup_logger, get_device, write_formulas, set_seed
 from src.data import DWTSDataset
-from src.evaluate import calculate_metrics
 from src.features import FeatureBuilder, build_all_features
-from src.losses import compute_loss, get_prior_loss
 from src.model import DWTSModel
-from src.utils import (
-    get_device,
-    load_config,
-    save_resolved_config,
-    setup_logger,
-    write_formulas,
-)
-
-DEFAULT_CONFIG_PATH = os.path.join("configs", "default.yaml")
+from src.losses import compute_loss, get_prior_loss
+from src.evaluate import calculate_metrics
 
 
-def _set_cpu_threads_leave_one_core() -> None:
-    """Set PyTorch intra-op/interop CPU thread counts.
+def _make_run_dir(cfg: Dict[str, Any]) -> str:
+    out_root = str(cfg["output_root"])
+    run_name = str(cfg["run_name"])
+    run_dir = os.path.join(out_root, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    os.makedirs(os.path.join(run_dir, "tb"), exist_ok=True)
+    os.makedirs(os.path.join(run_dir, "figures"), exist_ok=True)
+    return run_dir
 
-    Default: use (cpu_count - 1) to leave 1 core for other tasks.
-    Override: set env var DWTS_TORCH_THREADS (int) to force a specific value.
-    This is useful for multi-process Optuna tuning where each worker should be single-threaded.
+
+def _build_optimizer(model: torch.nn.Module, cfg: Dict[str, Any]) -> torch.optim.Optimizer:
     """
-    forced = os.environ.get("DWTS_TORCH_THREADS", "").strip()
-    if forced:
-        try:
-            threads = int(forced)
-            threads = max(1, threads)
-        except ValueError:
-            threads = None
-    else:
-        threads = None
-
-    if threads is None:
-        cpu = os.cpu_count() or 1
-        threads = max(1, cpu - 1)  # leave 1 core for other tasks
-
-    torch.set_num_threads(threads)
-    # inter-op threads (PyTorch may require set before any parallel work)
-    try:
-        torch.set_num_interop_threads(min(threads, 4))
-    except Exception:
-        pass
-
-
-def _ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def _resolve_resume_path(run_dir: str, resume_from: str) -> Optional[str]:
-    if resume_from is None:
-        return None
-    resume_from = str(resume_from)
-    if resume_from.lower() in ("none", ""):
-        return None
-    if resume_from.lower() in ("last", "best"):
-        return os.path.join(run_dir, f"model_{resume_from.lower()}.pt")
-    # treat as explicit path
-    return resume_from
-
-
-def _maybe_resume(
-    run_dir: str,
-    resume_from: str,
-    device: torch.device,
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-) -> Tuple[int, float, int]:
-    ckpt_path = _resolve_resume_path(run_dir, resume_from)
-    if not ckpt_path or not os.path.exists(ckpt_path):
-        logging.info(f"No resume checkpoint loaded. resume_from={resume_from}")
-        return 0, -float("inf"), 0
-
-    logging.info(f"Resuming from checkpoint: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(ckpt["model"])
-    optimizer.load_state_dict(ckpt["optimizer"])
-    start_epoch = int(ckpt.get("epoch", -1)) + 1
-    best_acc = float(ckpt.get("best_acc", -float("inf")))
-    patience_counter = int(ckpt.get("patience_counter", 0))
-    return start_epoch, best_acc, patience_counter
-
-
-def _build_optimizer(model: DWTSModel, config: Dict[str, Any]) -> torch.optim.Optimizer:
-    """AdamW with param_groups: weight_decay only on phi, not on theta/u/beta."""
-    lr = float(config["training"]["lr"])
-    weight_decay_phi = float(config["training"].get("weight_decay", 0.0))
+    AdamW param_groups:
+    - weight_decay ONLY on phi
+    - theta/u/beta/r no weight_decay
+    """
+    lr = float(cfg["training"]["lr"])
+    wd = float(cfg["training"].get("weight_decay", 0.0))
 
     phi_params = list(model.phi.parameters())
     other_params = []
-    for n, p in model.named_parameters():
+    for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if n.startswith("phi."):
+        if name.startswith("phi."):
             continue
         other_params.append(p)
 
     param_groups = [
         {"params": other_params, "weight_decay": 0.0},
-        {"params": phi_params, "weight_decay": weight_decay_phi},
+        {"params": phi_params, "weight_decay": wd},
     ]
     return torch.optim.AdamW(param_groups, lr=lr)
 
 
-def _build_scheduler(optimizer: torch.optim.Optimizer, config: Dict[str, Any]):
-    sched_cfg = config["training"].get("scheduler", {}) or {}
-    stype = str(sched_cfg.get("type", "none")).lower()
-
-    if stype == "none":
-        return None
-
-    if stype == "plateau":
-        factor = float(sched_cfg.get("plateau_factor", 0.5))
-        patience = int(sched_cfg.get("plateau_patience", 5))
-        min_lr = float(sched_cfg.get("min_lr", 1e-6))
+def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: Dict[str, Any]):
+    sch = cfg.get("training", {}).get("scheduler", {})
+    if str(sch.get("type", "none")).lower() == "plateau":
+        factor = float(sch.get("plateau_factor", 0.5))
+        patience = int(sch.get("plateau_patience", 5))
+        min_lr = float(sch.get("min_lr", 1e-6))
         return torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="max", factor=factor, patience=patience, min_lr=min_lr
         )
-
-    if stype == "warmup_cosine":
-        warmup_steps = int(sched_cfg.get("warmup_steps", 0))
-        total_steps = int(sched_cfg.get("total_steps", 0))
-        min_lr = float(sched_cfg.get("min_lr", 1e-6))
-
-        if total_steps <= 0:
-            return None
-
-        def lr_lambda(step: int):
-            if warmup_steps > 0 and step < warmup_steps:
-                return float(step + 1) / float(warmup_steps)
-            # cosine decay
-            progress = (step - warmup_steps) / max(1, (total_steps - warmup_steps))
-            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-            # map to [min_lr, 1.0]
-            return (min_lr / optimizer.param_groups[0]["lr"]) + (1.0 - (min_lr / optimizer.param_groups[0]["lr"])) * cosine
-
-        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
     return None
 
 
-def export_results(model: DWTSModel, dataset: DWTSDataset, all_feats: torch.Tensor, run_dir: str):
-    model.eval()
-    results = []
-    device = all_feats.device
-
-    with torch.no_grad():
-        for week in dataset.panel:
-            p_fan, s_total, alpha, _ = model(week, all_feats)
-            for i, tid_idx in enumerate(week["teams"]):
-                results.append(
-                    {
-                        "season": int(week["season"]),
-                        "week": int(week["week"]),
-                        "team_id": dataset.teams[tid_idx],
-                        "P_fan": float(p_fan[i].item()),
-                        "S_total": float(s_total[i].item()),
-                        "alpha": float(alpha.item()),
-                    }
-                )
-
-    pd.DataFrame(results).to_csv(os.path.join(run_dir, "pred_fan_shares.csv"), index=False)
+def _safe_mean(xs: List[Optional[float]]) -> Optional[float]:
+    ys = [x for x in xs if x is not None and not (isinstance(x, float) and (np.isnan(x)))]
+    if not ys:
+        return None
+    return float(np.mean(ys))
 
 
-def train(config_path: Optional[str] = None, overrides: Optional[Dict[str, Any]] = None) -> float:
-    _set_cpu_threads_leave_one_core()
-
-    config = load_config(DEFAULT_CONFIG_PATH, config_path, overrides)
-
-    run_dir = os.path.join(str(config["output_root"]), str(config["run_name"]))
-    _ensure_dir(run_dir)
-    _ensure_dir(os.path.join(run_dir, "tb"))
-
+def train(config_path: Optional[str] = None,
+          overrides: Optional[Dict[str, Any]] = None,
+          panel_indices: Optional[List[int]] = None) -> float:
+    cfg = load_config("configs/default.yaml", config_path, overrides)
+    run_dir = _make_run_dir(cfg)
     setup_logger(run_dir)
-    save_resolved_config(config, os.path.join(run_dir, "config_resolved.yaml"))
-    write_formulas(os.path.join(run_dir, "formulas.txt"), config)
 
-    device = get_device(str(config.get("device", "auto")))
-    logging.info(f"Using device: {device}")
+    save_resolved_config(cfg, os.path.join(run_dir, "config_resolved.yaml"))
+    write_formulas(os.path.join(run_dir, "formulas.txt"), cfg)
 
-    dataset = DWTSDataset(str(config["data_path"]), config)
-    fb = FeatureBuilder(dataset.df, config)
+    seed = int(cfg.get("training", {}).get("seed", cfg.get("seed", 42)))
+    set_seed(seed)
+
+    device = get_device(str(cfg["device"]))
+
+    dataset = DWTSDataset(str(cfg["data_path"]), cfg)
+    fb = FeatureBuilder(dataset.df, cfg)
     all_feats = build_all_features(dataset, fb).to(device)
 
-    model = DWTSModel(len(dataset.celebrities), len(dataset.partners), fb.dim, config).to(device)
-    optimizer = _build_optimizer(model, config)
+    model = DWTSModel(
+        num_celebs=len(dataset.celebrities),
+        num_partners=len(dataset.partners),
+        feat_dim=fb.dim,
+        num_obs=dataset.num_obs,
+        config=cfg,
+    ).to(device)
 
-    start_epoch, best_acc, patience_counter = _maybe_resume(
-        run_dir, str(config["training"].get("resume_from", "none")), device, model, optimizer
-    )
+    optimizer = _build_optimizer(model, cfg)
+    scheduler = _build_scheduler(optimizer, cfg)
 
-    scheduler = _build_scheduler(optimizer, config)
-    writer = SummaryWriter(os.path.join(run_dir, "tb"))
+    writer = SummaryWriter(os.path.join(run_dir, "tb")) if SummaryWriter is not None else None
 
-    epochs = int(config["training"]["epochs"])
-    patience = int(config["training"]["patience"])
-    monitor = str(config["training"].get("monitor", "train_ElimTop1Acc"))
+    start_epoch = 0
+    best_monitor = -1e18
+    monitor_name = str(cfg.get("training", {}).get("monitor", "train_BottomKAcc"))
 
-    grad_clip_norm = float(config["training"].get("grad_clip_norm", 0.0))
-    grad_accum_steps = int(config["training"].get("grad_accum_steps", 1))
-    grad_accum_steps = max(1, grad_accum_steps)
+    # resume
+    resume_from = str(cfg.get("training", {}).get("resume_from", "none")).lower()
+    if resume_from in ["last", "best"]:
+        ckpt_path = os.path.join(run_dir, f"model_{resume_from}.pt")
+        if os.path.exists(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+            model.load_state_dict(ckpt["model"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            start_epoch = int(ckpt.get("epoch", 0)) + 1
+            best_monitor = float(ckpt.get("best_monitor", best_monitor))
 
-    global_step = 0
+    epochs = int(cfg["training"]["epochs"])
+    patience = int(cfg["training"]["patience"])
+    grad_clip = float(cfg["training"].get("grad_clip_norm", 0.0))
+    accum_steps = max(1, int(cfg["training"].get("grad_accum_steps", 1)))
+
+    patience_counter = 0
+
+    panels = dataset.panel
+    if panel_indices is not None:
+        panels = [dataset.panel[i] for i in panel_indices]
 
     for epoch in range(start_epoch, epochs):
         model.train()
-        total_loss = 0.0
-        metrics_list = []
-
         optimizer.zero_grad(set_to_none=True)
 
-        for wi, week in enumerate(dataset.panel):
-            p_fan, s_total, alpha, _ = model(week, all_feats)
-            l_val, count = compute_loss(week, p_fan, s_total, config)
+        total_loss = 0.0
+        metrics_list: List[Dict[str, Any]] = []
+        step_count = 0
 
-            if count <= 0:
+        for week_data in panels:
+            p_fan, s_total, alpha, id_static = model(week_data, all_feats, mc_dropout=False, dropout_p=0.0)
+
+            l_base, used = compute_loss(week_data, p_fan, s_total, cfg)
+            if used == 0:
                 continue
 
-            loss = l_val + get_prior_loss(model, config)
-            loss = loss / grad_accum_steps
+            l_prior = get_prior_loss(model, cfg, week_data=week_data)
+
+            loss = l_base + l_prior
             loss.backward()
 
-            if (wi + 1) % grad_accum_steps == 0:
-                if grad_clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            step_count += 1
+            if step_count % accum_steps == 0:
+                if grad_clip > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            total_loss += float(loss.item()) * grad_accum_steps
+            total_loss += float(loss.item())
 
-            m = calculate_metrics(week, s_total)
-            if m:
+            m = calculate_metrics(week_data, s_total.detach(), cfg)
+            if m is not None:
                 metrics_list.append(m)
 
-            writer.add_scalar("Alpha/alpha", float(alpha.item()), global_step)
-            writer.add_scalar("Loss/step", float(loss.item()) * grad_accum_steps, global_step)
-            global_step += 1
+        if step_count % accum_steps != 0:
+            if grad_clip > 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
-        avg_top1 = float(sum(x["ElimTop1Acc"] for x in metrics_list) / max(1, len(metrics_list)))
-        avg_bottom2 = float(sum(x["Bottom2Acc"] for x in metrics_list) / max(1, len(metrics_list)))
-        avg_margin = float(sum(x["Margin"] for x in metrics_list) / max(1, len(metrics_list)))
-
-        logging.info(
-            f"Epoch {epoch:04d} | Loss {total_loss:.6f} | "
-            f"ElimTop1Acc {avg_top1:.4f} | ElimInBottom2Acc {avg_bottom2:.4f} | MeanMargin {avg_margin:.4f}"
-        )
-
-        writer.add_scalar("Loss/train", total_loss, epoch)
-        writer.add_scalar("ElimTop1Acc/train", avg_top1, epoch)
-        writer.add_scalar("ElimInBottom2Acc/train", avg_bottom2, epoch)
-        writer.add_scalar("MeanMargin/train", avg_margin, epoch)
-        writer.add_scalar("LR/lr", optimizer.param_groups[0]["lr"], epoch)
-
-        # Internal rule: always maximize monitor_val.
-        if monitor.lower() == "train_loss":
-            monitor_val = -total_loss
+        # epoch metrics
+        if metrics_list:
+            bottomk = float(np.mean([x["BottomKAcc"] for x in metrics_list if x.get("BottomKAcc") is not None]))
+            pairwise = _safe_mean([x.get("PairwiseOrderAcc") for x in metrics_list])
+            top1 = _safe_mean([x.get("Top1Acc") for x in metrics_list])
+            mean_margin = float(np.mean([x["MeanMargin"] for x in metrics_list if x.get("MeanMargin") is not None]))
+            avg_loglik = _safe_mean([x.get("AvgLogLik") for x in metrics_list])
+            rule_repro = float(np.mean([x["RuleReproRateWeek"] for x in metrics_list if x.get("RuleReproRateWeek") is not None]))
         else:
-            monitor_val = avg_top1  # default
+            bottomk, pairwise, top1, mean_margin, avg_loglik, rule_repro = 0.0, None, None, 0.0, None, 0.0
+
+        # choose monitor value
+        monitor_map = {
+            "train_BottomKAcc": bottomk,
+            "train_PairwiseOrderAcc": pairwise if pairwise is not None else -1e18,
+            "train_Top1Acc": top1 if top1 is not None else -1e18,
+            "train_RuleReproRateWeek": rule_repro,
+        }
+        monitor_val = float(monitor_map.get(monitor_name, bottomk))
+
+        if writer is not None:
+            writer.add_scalar("Loss/train", total_loss, epoch)
+            writer.add_scalar("BottomKAcc/train", bottomk, epoch)
+            if pairwise is not None:
+                writer.add_scalar("PairwiseOrderAcc/train", pairwise, epoch)
+            if top1 is not None:
+                writer.add_scalar("Top1Acc/train", top1, epoch)
+            writer.add_scalar("MeanMargin/train", mean_margin, epoch)
+            if avg_loglik is not None:
+                writer.add_scalar("AvgLogLik/train", avg_loglik, epoch)
+            writer.add_scalar("RuleReproRateWeek/train", rule_repro, epoch)
+            writer.add_scalar("LR/lr", float(optimizer.param_groups[0]["lr"]), epoch)
 
         if scheduler is not None:
-            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(avg_top1)
-            else:
-                scheduler.step()
-
-        improved = monitor_val > best_acc
+            scheduler.step(monitor_val)
 
         ckpt = {
             "epoch": epoch,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "best_acc": best_acc,
-            "patience_counter": patience_counter,
-            "monitor": monitor,
+            "best_monitor": best_monitor,
+            "monitor_name": monitor_name,
         }
-
         torch.save(ckpt, os.path.join(run_dir, "model_last.pt"))
 
+        improved = monitor_val > best_monitor
         if improved:
-            best_acc = monitor_val
-            patience_counter = 0
-            ckpt["best_acc"] = best_acc
+            best_monitor = monitor_val
+            ckpt["best_monitor"] = best_monitor
             torch.save(ckpt, os.path.join(run_dir, "model_best.pt"))
+            patience_counter = 0
         else:
             patience_counter += 1
 
-        if patience_counter >= patience:
-            logging.info(f"Early stopping triggered. patience={patience}")
-            break
-
-    writer.flush()
-    writer.close()
-
-    export_results(model, dataset, all_feats, run_dir)
-
-    with open(os.path.join(run_dir, "metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "best_monitor": best_acc,
-                "monitor": monitor,
-                "epochs_ran": epoch + 1,
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
+        print(
+            f"Epoch {epoch:04d} | Loss {total_loss:.6f} | "
+            f"BottomKAcc {bottomk:.4f} | "
+            f"PairwiseOrderAcc {(pairwise if pairwise is not None else float('nan')):.4f} | "
+            f"Top1Acc {(top1 if top1 is not None else float('nan')):.4f} | "
+            f"MeanMargin {mean_margin:.4f} | "
+            f"AvgLogLik {(avg_loglik if avg_loglik is not None else float('nan')):.4f} | "
+            f"RuleRepro {rule_repro:.4f} | "
+            f"monitor={monitor_name}:{monitor_val:.4f} | pat={patience_counter}/{patience}"
         )
 
-    return float(best_acc)
+        if patience_counter >= patience:
+            break
+
+    export_results(model, dataset, all_feats, fb, cfg, run_dir)
+    return float(best_monitor)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default=None)
-    parser.add_argument(
-        "--override",
-        type=str,
-        action="append",
-        default=None,
-        help="Override config entries, e.g., training.lr=0.001 (repeatable)",
-    )
-    args = parser.parse_args()
+def export_results(model: DWTSModel,
+                   dataset: DWTSDataset,
+                   all_feats: torch.Tensor,
+                   fb: FeatureBuilder,
+                   cfg: Dict[str, Any],
+                   run_dir: str) -> None:
+    """
+    Per team-week export:
+      - season, week, team_id
+      - P_fan, S_total, alpha
+      - p_elim = softmax(risk) where risk=-S_total
+      - true_eliminated / true_withdrew / pred_eliminated / hit (Y/empty)
+      - D_pf_minus_j, Z_pf_minus_j, Z_outlier_90/95
+      - best_loser_worst_winner_margin
 
-    overrides = None
-    if args.override:
-        overrides = {}
-        for kv in args.override:
-            if "=" not in kv:
-                continue
-            k, v = kv.split("=", 1)
-            k = k.strip()
-            v = v.strip()
-            # best-effort type casting
-            if v.lower() in ("true", "false"):
-                vv: Any = v.lower() == "true"
+    Additional:
+      - optional MC dropout CI columns for P_fan
+      - team-season summary: Z_mean, Z_max_abs, frac_outlier_90/95, n_weeks
+      - static params per team
+    """
+    device = all_feats.device
+    model.eval()
+
+    metrics_cfg = cfg.get("metrics", {})
+    z90 = float(metrics_cfg.get("outlier_z_90", 1.645))
+    z95 = float(metrics_cfg.get("outlier_z_95", 1.96))
+    eps = float(cfg.get("features", {}).get("eps", 1e-6))
+
+    inf_cfg = cfg.get("inference", {})
+    mc_passes = int(inf_cfg.get("mc_passes", 1))
+    mc_p = float(inf_cfg.get("mc_dropout_p", 0.0))
+    save_mc_samples = bool(inf_cfg.get("save_mc_samples", False))
+    mc_enabled = (mc_passes > 1 and mc_p > 0.0)
+
+    rows = []
+    sample_rows = []
+
+    with torch.no_grad():
+        for week_data in dataset.panel:
+            # deterministic forward
+            p_fan, s_total, alpha, _ = model(week_data, all_feats, mc_dropout=False, dropout_p=0.0)
+
+            teams_idx = week_data["teams"]
+            team_ids = [dataset.teams[i] for i in teams_idx]
+
+            j_pct = week_data["j_pct"].to(device)
+            D = (p_fan - j_pct)
+            muD = float(D.mean().item())
+            sdD = float(D.std(unbiased=False).item())
+            Z = (D - muD) / (sdD + eps)
+
+            true_elim_set = set(week_data.get("eliminated", []))
+            true_wd_set = set(week_data.get("withdrew", []))
+
+            # predicted elimination set: BottomK based on risk, excluding withdrew
+            K = len(true_elim_set)
+            pred_local_set = set()
+            if K > 0:
+                eff_local = [i for i, gid in enumerate(teams_idx) if gid not in true_wd_set]
+                if eff_local:
+                    risk_eff = (-s_total[torch.tensor(eff_local, device=device)])
+                    order_eff = torch.argsort(risk_eff, descending=True)
+                    topk_pos = order_eff[: min(K, len(eff_local))]
+                    pred_local_set = set(int(eff_local[int(p.item())]) for p in topk_pos)
+
+            risk = (-s_total)
+            p_elim = torch.softmax(risk, dim=0)
+
+            # margin computed on effective set (exclude withdrew)
+            loser_local = [i for i, gid in enumerate(teams_idx) if gid in true_elim_set and gid not in true_wd_set]
+            winner_local = [i for i, gid in enumerate(teams_idx) if gid not in true_elim_set and gid not in true_wd_set]
+            if loser_local and winner_local:
+                worst_winner = float(s_total[torch.tensor(winner_local, device=device)].min().item())
+                best_loser = float(s_total[torch.tensor(loser_local, device=device)].max().item())
+                margin = worst_winner - best_loser
             else:
-                try:
-                    if "." in v:
-                        vv = float(v)
-                    else:
-                        vv = int(v)
-                except ValueError:
-                    vv = v
-            overrides[k] = vv
+                margin = 0.0
 
-    train(config_path=args.config, overrides=overrides)
+            # per-row export
+            for local_i, tid in enumerate(team_ids):
+                global_team_idx = teams_idx[local_i]
+
+                true_elim_flag = "Y" if global_team_idx in true_elim_set else ""
+                true_wd_flag = "Y" if global_team_idx in true_wd_set else ""
+
+                pred_elim_flag = "Y" if local_i in pred_local_set else ""
+                hit_flag = "Y" if (pred_elim_flag == "Y" and true_elim_flag == "Y") else ""
+
+                z_val = float(Z[local_i].item())
+                z90_flag = "Y" if abs(z_val) > z90 else ""
+                z95_flag = "Y" if abs(z_val) > z95 else ""
+
+                rows.append({
+                    "season": int(week_data["season"]),
+                    "week": int(week_data["week"]),
+                    "team_id": tid,
+
+                    "P_fan": float(p_fan[local_i].item()),
+                    "S_total": float(s_total[local_i].item()),
+                    "alpha": float(alpha.item()),
+
+                    "p_elim": float(p_elim[local_i].item()),
+
+                    "true_eliminated": true_elim_flag,
+                    "true_withdrew": true_wd_flag,
+                    "pred_eliminated": pred_elim_flag,
+                    "hit": hit_flag,
+
+                    "D_pf_minus_j": float(D[local_i].item()),
+                    "Z_pf_minus_j": z_val,
+                    "Z_outlier_90": z90_flag,
+                    "Z_outlier_95": z95_flag,
+
+                    "best_loser_worst_winner_margin": float(margin),
+                })
+
+            # MC dropout for CI & optional long-format samples
+            if mc_enabled:
+                pf_samples = []
+                for s in range(mc_passes):
+                    pf_s, st_s, a_s, _ = model(week_data, all_feats, mc_dropout=True, dropout_p=mc_p)
+                    pf_samples.append(pf_s.unsqueeze(0))
+                    if save_mc_samples:
+                        for local_i, tid in enumerate(team_ids):
+                            sample_rows.append({
+                                "season": int(week_data["season"]),
+                                "week": int(week_data["week"]),
+                                "team_id": tid,
+                                "sample_id": int(s),
+                                "P_fan": float(pf_s[local_i].item()),
+                            })
+
+                pf_samples = torch.cat(pf_samples, dim=0)  # [S, n_team]
+                lo = torch.quantile(pf_samples, 0.025, dim=0)
+                hi = torch.quantile(pf_samples, 0.975, dim=0)
+
+                n_team = len(team_ids)
+                for k in range(n_team):
+                    rows[-n_team + k]["P_fan_ci_low_95"] = float(lo[k].item())
+                    rows[-n_team + k]["P_fan_ci_high_95"] = float(hi[k].item())
+
+    out_csv = os.path.join(run_dir, "pred_fan_shares_enriched.csv")
+    df_rows = pd.DataFrame(rows)
+    df_rows.to_csv(out_csv, index=False)
+
+    if save_mc_samples and sample_rows:
+        out_samp = os.path.join(run_dir, "pfan_samples_long.csv")
+        pd.DataFrame(sample_rows).to_csv(out_samp, index=False)
+
+    # team-season summary
+    if len(df_rows) > 0:
+        df_rows["absZ"] = df_rows["Z_pf_minus_j"].abs()
+        df_rows["is_out_90"] = df_rows["absZ"] > z90
+        df_rows["is_out_95"] = df_rows["absZ"] > z95
+
+        g = df_rows.groupby(["season", "team_id"], as_index=False)
+        zsum = g.agg(
+            Z_mean=("Z_pf_minus_j", "mean"),
+            Z_max_abs=("absZ", "max"),
+            frac_outlier_90=("is_out_90", "mean"),
+            frac_outlier_95=("is_out_95", "mean"),
+            n_weeks=("week", "count"),
+        )
+        zsum.to_csv(os.path.join(run_dir, "team_season_summary.csv"), index=False)
+
+    _export_team_params(model, dataset, all_feats, fb, run_dir)
+
+
+def _export_team_params(model: DWTSModel,
+                        dataset: DWTSDataset,
+                        all_feats: torch.Tensor,
+                        fb: FeatureBuilder,
+                        run_dir: str) -> None:
+    device = all_feats.device
+    model.eval()
+
+    phi_vec = model.phi.weight.detach().cpu().view(-1).tolist()
+
+    rows = []
+    with torch.no_grad():
+        for tid in dataset.teams:
+            row0 = dataset.df[dataset.df["team_id"] == tid].iloc[0]
+            celeb = str(row0["celebrity_name"])
+            partner = str(row0["ballroom_partner"])
+
+            c_idx = torch.tensor([dataset.c_to_idx[celeb]], device=device, dtype=torch.long)
+            p_idx = torch.tensor([dataset.p_to_idx[partner]], device=device, dtype=torch.long)
+            t_idx = torch.tensor([dataset.team_to_idx[tid]], device=device, dtype=torch.long)
+
+            theta = float(model.theta(c_idx).squeeze().item())
+            u = float(model.u(p_idx).squeeze().item())
+            x_i = all_feats[t_idx].detach().cpu().view(-1).tolist()
+
+            rows.append({
+                "team_id": tid,
+                "celebrity_name": celeb,
+                "ballroom_partner": partner,
+                "theta": theta,
+                "u_partner": u,
+                "x_i": json.dumps(x_i),
+                "phi": json.dumps(phi_vec),
+            })
+
+    pd.DataFrame(rows).to_csv(os.path.join(run_dir, "team_static_params.csv"), index=False)
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default=None)
+    args = parser.parse_args()
+
+    train(config_path=args.config)

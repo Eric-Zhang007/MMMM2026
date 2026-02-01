@@ -1,57 +1,73 @@
+seed: 42
 data_path: "2026_MCM_Problem_C_Data.csv"
 output_root: "outputs"
 run_name: "dwts_baseline"
 device: "auto"
 
 features:
+  eps: 1e-6
   use_homestate: true
-  eps: 1.0e-6
   age_transform: "log_zscore"
 
 model:
+  # alpha variance tradeoff
   k_variance_ratio: 1.0
+
+  # performance channel scale
   lambda_perf: 1.0
+
+  # soft rank temperature for seasons not using percent rule
   tau_rank: 0.7
-  lambda_beta: 0.01
+
+  # judge-performance weights
   beta_center: 1.0
+  lambda_beta: 0.01
+
+  # static feature regularization
   phi_reg: "elasticnet"
   lambda_phi_l1: 0.001
   lambda_phi_l2: 0.001
-  lambda_theta: 0.01
-  lambda_u: 0.01
+
+  # identity embeddings regularization
+  lambda_theta: 0.5
+  lambda_u: 0.5
+
+  # random-walk shock r_{i,t} (fan-side only)
+  lambda_r: 0.01
+  lambda_rw: 0.05
 
 loss:
   xi_margin: 0.05
+  twist_mode: "hinge"
   xi_twist: 0.05
   xi_tb: 0.05
   lambdaA: 0.2
   lambdaB: 0.2
-  twist_mode: "hinge"
 
 training:
-  train_mode: "all_train"
   epochs: 200
   lr: 0.001
-  weight_decay: 0
+  weight_decay: 0.01
   grad_clip_norm: 1.0
   grad_accum_steps: 8
   patience: 20
-  monitor: "train_ElimTop1Acc"
-  resume_from: "none"
+
+  # recommended main monitor
+  monitor: "train_BottomKAcc"
+  resume_from: "last"
 
   scheduler:
     type: "plateau"
     plateau_factor: 0.5
     plateau_patience: 5
-    min_lr: 1.0e-6
-    warmup_steps: 0
-    total_steps: 0
+    min_lr: 1e-6
 
-tune:
-  enabled: false
-  n_trials: 80
-  n_jobs: "auto"
-  allow_parallel_gpu: false
-  epochs: 80
-  patience: 10
-  study_name: "dwts_tpe"
+metrics:
+  tau_ll: 1.0
+  outlier_z_90: 1.645
+  outlier_z_95: 1.96
+
+inference:
+  mc_passes: 1
+  mc_dropout_p: 0.0
+  save_mc_samples: false
