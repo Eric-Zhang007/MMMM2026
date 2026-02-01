@@ -44,30 +44,30 @@ search_space:
 
   model.lambda_theta:
     type: float
-    low: 0.05
-    high: 2.0
+    low: 0.1
+    high: 1.0
     log: true
 
   model.lambda_u:
     type: float
-    low: 0.05
-    high: 2.0
+    low: 0.5
+    high: 5.0
     log: true
 
   model.lambda_r:
     type: float
-    low: 0.0
-    high: 0.2
+    low: 0.5
+    high: 3
 
   model.lambda_rw:
     type: float
-    low: 0.0
-    high: 0.5
+    low: 0.5
+    high: 3.0
 
   model.lambda_beta:
     type: float
     low: 0.0
-    high: 0.2
+    high: 1.0
 
   model.lambda_phi_l1:
     type: float
