@@ -16,6 +16,14 @@ from typing import Dict, Any, List
 from src.train import train
 
 
+def _is_complete(run_dir: str) -> bool:
+    need = ["model_best.pt", "pred_fan_shares_enriched.csv", "metrics_history.csv"]
+    for f in need:
+        if not os.path.exists(os.path.join(run_dir, f)):
+            return False
+    return True
+
+
 def _parse_seeds(s: str) -> List[int]:
     return [int(x.strip()) for x in s.split(",") if x.strip()]
 
@@ -44,6 +52,9 @@ def _exp_list() -> List[Dict[str, Any]]:
         {"name": "alpha_variance", "overrides": {"model.alpha_mode": "variance"}},
         {"name": "alpha_entropy", "overrides": {"model.alpha_mode": "entropy", "model.alpha_eps": 1e-8}},
         {"name": "alpha_hhi", "overrides": {"model.alpha_mode": "hhi", "model.alpha_eps": 1e-8}},
+
+        # twist ablation: I_twist ≡ 0
+        {"name": "twist_off", "overrides": {"loss.twist_mode": "none"}},
     ]
 
 
@@ -79,7 +90,11 @@ def main():
             overrides["output_root"] = args.output_root
             overrides["run_name"] = run_name
             overrides["training.seed"] = seed
-            overrides["training.resume_from"] = "none"
+            run_dir = os.path.join(args.output_root, run_name)
+            if _is_complete(run_dir):
+                print(f"\n=== SKIP exp={exp['name']} seed={seed} (complete) run={run_name} ===")
+                continue
+            overrides["training.resume_from"] = "last"
 
             print(f"\n=== RUN exp={exp['name']} seed={seed} run={run_name} ===")
             if args.dry_run:
@@ -87,10 +102,14 @@ def main():
 
             best_val = float(train(config_path=args.base_config, overrides=overrides))
 
-            run_dir = os.path.join(args.output_root, run_name)
+            # run_dir already set above
             best_metrics_path = os.path.join(run_dir, "best_metrics.json")
+            last_metrics_path = os.path.join(run_dir, "last_metrics.json")
             if os.path.exists(best_metrics_path):
                 with open(best_metrics_path, "r", encoding="utf-8") as f:
+                    bm = json.load(f)
+            elif os.path.exists(last_metrics_path):
+                with open(last_metrics_path, "r", encoding="utf-8") as f:
                     bm = json.load(f)
             else:
                 bm = {}

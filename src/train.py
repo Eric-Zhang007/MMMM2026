@@ -109,6 +109,19 @@ def train(config_path: Optional[str] = None,
     best_monitor = -1e18
     monitor_name = str(cfg.get("training", {}).get("monitor", "train_BottomKAcc"))
 
+    # persistent epoch-level logs
+    metrics_history_path = os.path.join(run_dir, "metrics_history.csv")
+    if not os.path.exists(metrics_history_path):
+        pd.DataFrame(columns=[
+            "epoch","loss","BottomKAcc","PairwiseOrderAcc","Top1Acc","MeanMargin","AvgLogLik","RuleReproRateWeek",
+            "monitor_name","monitor_val","best_monitor","improved"
+        ]).to_csv(metrics_history_path, index=False)
+
+    def _append_metrics_row(row: Dict[str, Any]) -> None:
+        pd.DataFrame([row]).to_csv(metrics_history_path, mode="a", header=False, index=False)
+        with open(os.path.join(run_dir, "last_metrics.json"), "w", encoding="utf-8") as f:
+            json.dump(row, f, ensure_ascii=False, indent=2)
+
     # resume
     resume_from = str(cfg.get("training", {}).get("resume_from", "none")).lower()
     if resume_from in ["last", "best"]:
@@ -160,28 +173,15 @@ def train(config_path: Optional[str] = None,
 
             total_loss += float(loss.item())
 
-            # Metrics are evaluated after the epoch on a fixed weight snapshot.
+            m = calculate_metrics(week_data, s_total.detach(), cfg)
+            if m is not None:
+                metrics_list.append(m)
 
         if step_count % accum_steps != 0:
             if grad_clip > 0.0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
-
-
-        # Evaluate metrics on a single, fixed snapshot (end-of-epoch weights)
-        eval_scope = str(cfg.get("training", {}).get("eval_scope", "train")).lower()
-        panels_eval = panels if eval_scope == "train" else dataset.panel
-
-        model.eval()
-        metrics_list = []
-        with torch.no_grad():
-            for week_data in panels_eval:
-                p_fan, s_total, alpha, _ = model(week_data, all_feats, mc_dropout=False, dropout_p=0.0)
-                m = calculate_metrics(week_data, s_total.detach(), cfg)
-                if m is not None:
-                    metrics_list.append(m)
-        model.train()
 
         # epoch metrics
         if metrics_list:
@@ -229,10 +229,29 @@ def train(config_path: Optional[str] = None,
         torch.save(ckpt, os.path.join(run_dir, "model_last.pt"))
 
         improved = monitor_val > best_monitor
+        row = {
+            "epoch": int(epoch),
+            "loss": float(total_loss),
+            "BottomKAcc": float(bottomk),
+            "PairwiseOrderAcc": float(pairwise) if pairwise is not None else None,
+            "Top1Acc": float(top1) if top1 is not None else None,
+            "MeanMargin": float(mean_margin),
+            "AvgLogLik": float(avg_loglik) if avg_loglik is not None else None,
+            "RuleReproRateWeek": float(rule_repro),
+            "monitor_name": str(monitor_name),
+            "monitor_val": float(monitor_val),
+            "best_monitor": float(best_monitor),
+            "improved": bool(improved),
+        }
+        _append_metrics_row(row)
         if improved:
             best_monitor = monitor_val
             ckpt["best_monitor"] = best_monitor
             torch.save(ckpt, os.path.join(run_dir, "model_best.pt"))
+            row_best = dict(row)
+            row_best["best_monitor"] = float(best_monitor)
+            with open(os.path.join(run_dir, "best_metrics.json"), "w", encoding="utf-8") as f:
+                json.dump(row_best, f, ensure_ascii=False, indent=2)
             patience_counter = 0
         else:
             patience_counter += 1
@@ -251,7 +270,27 @@ def train(config_path: Optional[str] = None,
         if patience_counter >= patience:
             break
 
+    # Export using the BEST checkpoint weights for consistency
+    best_ckpt_path = os.path.join(run_dir, "model_best.pt")
+    if os.path.exists(best_ckpt_path):
+        ckpt_best = torch.load(best_ckpt_path, map_location="cpu")
+        model.load_state_dict(ckpt_best["model"])
+        model.eval()
+
     export_results(model, dataset, all_feats, fb, cfg, run_dir)
+
+    try:
+        dfp = pd.read_csv(os.path.join(run_dir, "pred_fan_shares_enriched.csv"))
+        summary = {
+            "best_monitor": float(best_monitor),
+            "n_rows": int(len(dfp)),
+            "alpha_mean": float(dfp["alpha"].mean()) if ("alpha" in dfp.columns and len(dfp)) else None,
+        }
+        with open(os.path.join(run_dir, "export_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
     return float(best_monitor)
 
 

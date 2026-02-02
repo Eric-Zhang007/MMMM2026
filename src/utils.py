@@ -110,18 +110,43 @@ def set_seed(seed: int) -> None:
 def write_formulas(path: str, cfg: Dict[str, Any]) -> None:
     eps = float(cfg["features"]["eps"])
     k = float(cfg["model"]["k_variance_ratio"])
+    lam_r = float(cfg["model"].get("lambda_r", 0.0))
     lam_rw = float(cfg["model"].get("lambda_rw", 0.0))
+    phi_reg = str(cfg["model"].get("phi_reg", "none")).lower()
+    lam_phi_l1 = float(cfg["model"].get("lambda_phi_l1", 0.0))
+    lam_phi_l2 = float(cfg["model"].get("lambda_phi_l2", 0.0))
+    dzj_side = str(cfg["model"].get("dzj_side", "fan")).lower()
+    lam_dzj_fan = float(cfg["model"].get("lambda_dzj_fan", 1.0))
+
     formulas = rf"""
 1. IdentityScore_i = \theta_{{celebrity(i)}} + u_{{partner(i)}} + \phi^T x_i
-2. PerfInput_{{i,t}} = \beta_1 zJ_{{i,t}} + \beta_2 \Delta zJ_{{i,t}}
-3. \sigma_{{fan}}^2[s,t] = Var_{{i \in A_{{s,t}}}}(IdentityScore_i)
-4. \sigma_{{judge}}^2[s,t] = Var_{{i \in A_{{s,t}}}}(J\_pct_{{i,t}})
-5. \alpha_{{s,t}} = \frac{{\sigma_{{judge}}^2}}{{\sigma_{{judge}}^2 + {k}\cdot\sigma_{{fan}}^2 + {eps}}}
-6. \eta_{{i,t}} = (1-\alpha)\cdot IdentityScore_i + \alpha\cdot \lambda_{{perf}}\cdot PerfInput_{{i,t}} + r_{{i,t}}
-7. P\_fan_{{i,t}} = softmax(\eta_{{i,t}})
-8. S\_total (Percent seasons) = J\_pct + P\_fan
-9. Random-walk prior: L_rw = {lam_rw} * mean((r_{{i,t}} - r_{{i,t-1}})^2)
-10. Base pairwise hinge: L_base = mean_{i in W, j in L} ReLU(\xi - (S_i - S_j))
+2. JudgePerf_{{i,t}} = \beta_1 zJ_{{i,t}}
+3. DeltaJudge_{{i,t}} = \beta_2 \Delta zJ_{{i,t}}
+4. \sigma_{{fan}}^2[s,t] = Var_{{i \in A_{{s,t}}}}(IdentityScore_i)
+5. \sigma_{{judge}}^2[s,t] = Var_{{i \in A_{{s,t}}}}(J\_pct_{{i,t}})
+6. \alpha_{{s,t}} = \frac{{\sigma_{{judge}}^2}}{{\sigma_{{judge}}^2 + {k}\cdot\sigma_{{fan}}^2 + {eps}}}
+
+7. Random-walk shock (fan-side): IdentityDyn_{{i,t}} = IdentityScore_i + r_{{i,t}}
+
+8. Utility:
+   if dzj\_side = judge:
+     \eta_{{i,t}} = (1-\alpha)\cdot IdentityDyn_{{i,t}} + \alpha\cdot \lambda_{{perf}}\cdot(\beta_1 zJ_{{i,t}} + \beta_2 \Delta zJ_{{i,t}})
+   if dzj\_side = fan:
+     \eta_{{i,t}} = (1-\alpha)\cdot\big(IdentityDyn_{{i,t}} + {lam_dzj_fan}\cdot \beta_2 \Delta zJ_{{i,t}}\big)
+                  + \alpha\cdot \lambda_{{perf}}\cdot(\beta_1 zJ_{{i,t}})
+
+9. P\_fan_{{i,t}} = softmax(\eta_{{i,t}})
+
+10. S\_total (Percent seasons) = J\_pct + P\_fan
+
+11. Priors and total loss:
+    L\_r  = {lam_r} * mean(r_{{i,t}}^2)
+    L\_rw = {lam_rw} * mean((r_{{i,t}} - r_{{i,t-1}})^2)
+    L\_\phi follows {phi_reg} with (\lambda_{{\phi,1}}, \lambda_{{\phi,2}}) = ({lam_phi_l1}, {lam_phi_l2})
+    L\_base = mean_{{w \in W, \ell \in L}} ReLU(\xi - (S_w - S_\ell))
+    L = L\_base + L\_twist + L\_\theta + L\_u + L\_\phi + L\_\beta + L\_r + L\_rw
 """
+
     with open(path, "w", encoding="utf-8") as f:
-        f.write(formulas.strip() + "\n")
+        f.write(formulas.strip() + "
+")

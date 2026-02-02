@@ -131,13 +131,24 @@ class DWTSModel(nn.Module):
         dzj = week_data["dzj"].to(device)
         if not perf_use_dzj:
             dzj = torch.zeros_like(dzj)
-        perf_in = self.beta[0] * zj + self.beta[1] * dzj
+
+        # Performance decomposition
+        perf_zj = self.beta[0] * zj
+        perf_dzj = self.beta[1] * dzj
+
+        dzj_side = str(mcfg.get("dzj_side", "fan")).lower()
+        lambda_dzj_fan = float(mcfg.get("lambda_dzj_fan", 1.0))
 
         j_pct = week_data["j_pct"].to(device)
         alpha = self._compute_alpha(id_static=id_static, j_pct=j_pct, eps=eps)
 
         lambda_perf = float(mcfg.get("lambda_perf", 1.0))
-        eta = (1.0 - alpha) * id_dyn + alpha * lambda_perf * perf_in
+        if dzj_side == "judge":
+            perf_in = perf_zj + perf_dzj
+            eta = (1.0 - alpha) * id_dyn + alpha * lambda_perf * perf_in
+        else:
+            # default: move ΔzJ to fan-side utility only (does not affect alpha dispersion)
+            eta = (1.0 - alpha) * (id_dyn + lambda_dzj_fan * perf_dzj) + alpha * lambda_perf * perf_zj
 
         p = float(dropout_p or 0.0)
         if p > 0.0:
