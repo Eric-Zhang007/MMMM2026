@@ -1,0 +1,52 @@
+seed: 42
+data_path: 2026_MCM_Problem_C_Data.csv
+output_root: outputs/dwts_tune_cpu__tune
+run_name: tune_cpu_trial_0033
+device: auto
+features:
+  eps: 1.0e-06
+  use_homestate: true
+  age_transform: log_zscore
+model:
+  k_variance_ratio: 7.125239764297713
+  lambda_perf: 0.6523265084290686
+  tau_rank: 0.5133537741147733
+  beta_center: 1.0
+  lambda_beta: 0.7188795600307194
+  phi_reg: elasticnet
+  lambda_phi_l1: 0.009875740083135048
+  lambda_phi_l2: 0.006921483657114858
+  lambda_theta: 0.22967769712174518
+  lambda_u: 0.5402490229686813
+  lambda_r: 0.817202051124637
+  lambda_rw: 1.975398472488091
+loss:
+  xi_margin: 0.05629932463682863
+  twist_mode: hinge
+  xi_twist: 0.05
+  xi_tb: 0.05
+  lambdaA: 0.2
+  lambdaB: 0.2
+training:
+  epochs: 120
+  lr: 0.0013909185511146369
+  weight_decay: 0.036714560879789915
+  grad_clip_norm: 1.0
+  grad_accum_steps: 8
+  patience: 20
+  monitor: train_BottomKAcc
+  resume_from: none
+  scheduler:
+    type: plateau
+    plateau_factor: 0.5
+    plateau_patience: 5
+    min_lr: 1e-6
+  device: cpu
+metrics:
+  tau_ll: 1.0
+  outlier_z_90: 1.645
+  outlier_z_95: 1.96
+inference:
+  mc_passes: 1
+  mc_dropout_p: 0.0
+  save_mc_samples: false

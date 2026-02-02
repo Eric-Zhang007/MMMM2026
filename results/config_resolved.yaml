@@ -1,0 +1,51 @@
+data_path: 2026_MCM_Problem_C_Data.csv
+output_root: outputs_gpu
+run_name: dwts_baseline
+device: auto
+features:
+  use_homestate: true
+  eps: 1.0e-06
+  age_transform: log_zscore
+model:
+  k_variance_ratio: 14.544162134234904
+  lambda_perf: 1.0
+  tau_rank: 1.2452724763484073
+  lambda_beta: 0.003688749809549752
+  beta_center: 1.0
+  phi_reg: elasticnet
+  lambda_phi_l1: 0.0014298232970300835
+  lambda_phi_l2: 0.0002779680879935974
+  lambda_theta: 0.00118627302673414
+  lambda_u: 0.021522409207889222
+loss:
+  xi_margin: 0.011711788264869207
+  xi_twist: 0.06420653431989592
+  xi_tb: 0.027648913830431613
+  lambdaA: 0.14062255765674903
+  lambdaB: 0.009147604808717407
+  twist_mode: hinge
+training:
+  train_mode: all_train
+  epochs: 200
+  lr: 0.002702147311215525
+  weight_decay: 0.010336190984459781
+  grad_clip_norm: 1.0
+  grad_accum_steps: 8
+  patience: 20
+  monitor: train_ElimTop1Acc
+  resume_from: none
+  scheduler:
+    type: plateau
+    plateau_factor: 0.5
+    plateau_patience: 5
+    min_lr: 1.0e-06
+    warmup_steps: 0
+    total_steps: 0
+tune:
+  enabled: true
+  n_trials: 80
+  n_jobs: 24
+  allow_parallel_gpu: false
+  epochs: 60
+  patience: 10
+  study_name: dwts_tpe

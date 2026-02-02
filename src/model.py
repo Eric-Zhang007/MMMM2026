@@ -4,6 +4,11 @@ import torch.nn.functional as F
 from typing import Dict
 
 
+def _safe_normalize(p: torch.Tensor, eps: float) -> torch.Tensor:
+    p2 = p + eps
+    return p2 / (p2.sum() + eps)
+
+
 class DWTSModel(nn.Module):
     """
     Identity (static):
@@ -15,11 +20,9 @@ class DWTSModel(nn.Module):
     Identity (dynamic for fan utility):
         id_dyn = id_static + r_{i,t}
 
-    Alpha uses ONLY static identity dispersion:
-        sigma_fan^2 = Var(id_static)
-        sigma_judge^2 = Var(j_pct)
-
-        alpha = sigma_judge^2 / (sigma_judge^2 + k * sigma_fan^2 + eps)
+    Alpha uses ONLY static identity dispersion (default: variance).
+    You can switch alpha_mode to 'entropy' or 'hhi' (concentration-based),
+    and optionally force alpha at inference time.
 
     Utility:
         eta = (1-alpha)*id_dyn + alpha*lambda_perf*perf_in
@@ -47,6 +50,53 @@ class DWTSModel(nn.Module):
         nn.init.normal_(self.u.weight, std=0.01)
         nn.init.normal_(self.phi.weight, std=0.01)
 
+    def _compute_alpha(self, id_static: torch.Tensor, j_pct: torch.Tensor, eps: float) -> torch.Tensor:
+        mcfg = self.config.get("model", {})
+        mode = str(mcfg.get("alpha_mode", "variance")).lower()
+        k = float(mcfg.get("k_variance_ratio", 1.0))
+
+        # Optional: inference-only alpha override (used for alpha=0/1 stress tests)
+        inf_cfg = self.config.get("inference", {})
+        force_alpha = inf_cfg.get("force_alpha", None)
+        if force_alpha is not None:
+            fa = float(force_alpha)
+            fa = max(0.0, min(1.0, fa))
+            return id_static.new_tensor(fa)
+
+        if mode == "variance":
+            sigma_fan2 = torch.var(id_static, unbiased=False)
+            sigma_judge2 = torch.var(j_pct, unbiased=False)
+            return sigma_judge2 / (sigma_judge2 + k * sigma_fan2 + eps)
+
+        # concentration-based modes: compare fan vs judge "peakedness"
+        tau_rank = float(mcfg.get("tau_rank", 0.7))
+        tau_alpha = float(mcfg.get("alpha_tau", tau_rank))
+        alpha_eps = float(mcfg.get("alpha_eps", eps))
+
+        # fan distribution from static identity (NOT using r_t)
+        p_fan_static = F.softmax(id_static / max(tau_alpha, 1e-6), dim=0)
+
+        # judge distribution: j_pct is already a distribution, but normalize safely
+        p_j = _safe_normalize(j_pct, alpha_eps)
+
+        if mode == "hhi":
+            c_fan = torch.sum(p_fan_static.pow(2))
+            c_j = torch.sum(p_j.pow(2))
+            return c_j / (c_j + k * c_fan + alpha_eps)
+
+        if mode == "entropy":
+            h_fan = -torch.sum(p_fan_static * torch.log(p_fan_static + alpha_eps))
+            h_j = -torch.sum(p_j * torch.log(p_j + alpha_eps))
+            neff_fan = torch.exp(h_fan)
+            neff_j = torch.exp(h_j)
+            c_fan = 1.0 / (neff_fan + alpha_eps)
+            c_j = 1.0 / (neff_j + alpha_eps)
+            return c_j / (c_j + k * c_fan + alpha_eps)
+
+        sigma_fan2 = torch.var(id_static, unbiased=False)
+        sigma_judge2 = torch.var(j_pct, unbiased=False)
+        return sigma_judge2 / (sigma_judge2 + k * sigma_fan2 + eps)
+
     def forward(self, week_data: Dict, all_feats: torch.Tensor, *, mc_dropout: bool = False, dropout_p: float = 0.0):
         device = all_feats.device
         eps = float(self.config.get("features", {}).get("eps", 1e-6))
@@ -58,11 +108,19 @@ class DWTSModel(nn.Module):
 
         theta_base = self.theta(c_idx).squeeze(-1)
         u_base = self.u(p_idx).squeeze(-1)
-        phi_x = self.phi(all_feats[t_idx]).squeeze(-1)
+        mcfg = self.config.get("model", {})
+        use_phi = bool(mcfg.get("use_phi", True))
+        use_r = bool(mcfg.get("use_r", True))
+        perf_use_dzj = bool(mcfg.get("perf_use_dzj", True))
+
+        if use_phi:
+            phi_x = self.phi(all_feats[t_idx]).squeeze(-1)
+        else:
+            phi_x = torch.zeros_like(theta_base)
 
         id_static = theta_base + u_base + phi_x
 
-        if obs_idx.numel() == id_static.numel():
+        if use_r and obs_idx.numel() == id_static.numel():
             r_t = self.r(obs_idx).squeeze(-1)
         else:
             r_t = torch.zeros_like(id_static)
@@ -71,15 +129,14 @@ class DWTSModel(nn.Module):
 
         zj = week_data["zj"].to(device)
         dzj = week_data["dzj"].to(device)
+        if not perf_use_dzj:
+            dzj = torch.zeros_like(dzj)
         perf_in = self.beta[0] * zj + self.beta[1] * dzj
 
-        sigma_fan2 = torch.var(id_static, unbiased=False)
-        sigma_judge2 = torch.var(week_data["j_pct"].to(device), unbiased=False)
+        j_pct = week_data["j_pct"].to(device)
+        alpha = self._compute_alpha(id_static=id_static, j_pct=j_pct, eps=eps)
 
-        k = float(self.config.get("model", {}).get("k_variance_ratio", 1.0))
-        alpha = sigma_judge2 / (sigma_judge2 + k * sigma_fan2 + eps)
-
-        lambda_perf = float(self.config.get("model", {}).get("lambda_perf", 1.0))
+        lambda_perf = float(mcfg.get("lambda_perf", 1.0))
         eta = (1.0 - alpha) * id_dyn + alpha * lambda_perf * perf_in
 
         p = float(dropout_p or 0.0)
@@ -90,11 +147,11 @@ class DWTSModel(nn.Module):
 
         season = int(week_data["season"])
         if 3 <= season <= 27:
-            s_total = week_data["j_pct"].to(device) + p_fan
+            s_total = j_pct + p_fan
         else:
             rj = week_data["rj"].to(device)
-            tau = float(self.config.get("model", {}).get("tau_rank", 0.7))
-            diff = (eta.unsqueeze(0) - eta.unsqueeze(1)) / tau
+            tau = float(mcfg.get("tau_rank", 0.7))
+            diff = (eta.unsqueeze(0) - eta.unsqueeze(1)) / max(tau, 1e-6)
             soft_rank = 1.0 + torch.sum(torch.sigmoid(diff), dim=1) - 0.5
             s_total = -(rj + soft_rank)
 

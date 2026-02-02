@@ -1,0 +1,12 @@
+
+1. IdentityScore_i = \theta_{celebrity(i)} + u_{partner(i)} + \phi^T x_i
+2. PerformanceInput_{i,t} = \beta_1 zJ_{i,t} + \beta_2 \Delta zJ_{i,t}
+3. \sigma_{fan}^2[s,t] = Var_{i \in A_{s,t}}(IdentityScore_i)
+4. \sigma_{judge}^2[s,t] = Var_{i \in A_{s,t}}(J\_pct_{i,t})
+5. \alpha_{s,t} = \frac{\sigma_{judge}^2}{\sigma_{judge}^2 + 14.544162134234904 \cdot \sigma_{fan}^2 + 1e-06}
+6. \eta_{i,t} = (1 - \alpha_{s,t}) \cdot IdentityScore_i + \alpha_{s,t} \cdot \lambda_{perf} \cdot PerformanceInput_{i,t}
+7. P\_fan_{i,t} = \text{softmax}_{i \in A_{s,t}}(\eta_{i,t})
+8. S\_total_{i,t} (Percent) = J\_pct_{i,t} + P\_fan_{i,t}
+9. S\_total_{i,t} (Rank) = -(rJ_{i,t} + 1 + \sum_{k \neq i} \sigma(\frac{\eta_{k,t} - \eta_{i,t}}{\tau_{rank}}))
+10. L\_base = \frac{1}{|W||L|} \sum_{i \in W, j \in L} \text{ReLU}(\xi_m - (S\_total_i - S\_total_j))
+11. Twist Loss (S28+): I_{twist} \cdot (\lambda_A L_A + \lambda_B L_B)

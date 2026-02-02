@@ -160,15 +160,28 @@ def train(config_path: Optional[str] = None,
 
             total_loss += float(loss.item())
 
-            m = calculate_metrics(week_data, s_total.detach(), cfg)
-            if m is not None:
-                metrics_list.append(m)
+            # Metrics are evaluated after the epoch on a fixed weight snapshot.
 
         if step_count % accum_steps != 0:
             if grad_clip > 0.0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+
+
+        # Evaluate metrics on a single, fixed snapshot (end-of-epoch weights)
+        eval_scope = str(cfg.get("training", {}).get("eval_scope", "train")).lower()
+        panels_eval = panels if eval_scope == "train" else dataset.panel
+
+        model.eval()
+        metrics_list = []
+        with torch.no_grad():
+            for week_data in panels_eval:
+                p_fan, s_total, alpha, _ = model(week_data, all_feats, mc_dropout=False, dropout_p=0.0)
+                m = calculate_metrics(week_data, s_total.detach(), cfg)
+                if m is not None:
+                    metrics_list.append(m)
+        model.train()
 
         # epoch metrics
         if metrics_list:
