@@ -51,18 +51,18 @@ search_space:
   model.lambda_u:
     type: float
     low: 0.5
-    high: 5.0
+    high: 3.0
     log: true
 
   model.lambda_r:
     type: float
-    low: 0.5
-    high: 3
+    low: 1.5
+    high: 5.0
 
   model.lambda_rw:
     type: float
-    low: 0.5
-    high: 3.0
+    low: 4.0
+    high: 10.0
 
   model.lambda_beta:
     type: float
@@ -77,7 +77,7 @@ search_space:
   model.lambda_phi_l2:
     type: float
     low: 0.0
-    high: 0.01
+    high: 0.0
 
   loss.xi_margin:
     type: float
@@ -93,4 +93,4 @@ search_space:
   training.weight_decay:
     type: float
     low: 0.0
-    high: 0.05
+    high: 0.0001
